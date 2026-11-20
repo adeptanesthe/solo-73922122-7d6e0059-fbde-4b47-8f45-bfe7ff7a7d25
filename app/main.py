@@ -107,9 +107,12 @@ def _render_result(payload: dict) -> str:
     parts.append("<h2>各候选边长的峰值用量</h2><table><tr><th>边长 s</th>"
                  "<th>峰值图内激活元素数</th><th>对给定预算</th></tr>"
                  f"{rows}</table>")
-    parts.append("<p class='note'>窗口公式：输出块 (r0:r1, c0:c1) 对应图内行窗口 "
-                 "[2·r0−5, 2·(r1−1)+6)、列窗口同理，再裁到图界；"
-                 "元素数 = 高 × 宽 × 输入通道数（本网络输入为 1 通道）。</p>")
+    parts.append("<p class='note'>窗口公式：输出块 (r0:r1, c0:c1) 先求 layer2 "
+                 "dilation tap 依赖的 layer1 输出矩形（越界 tap 是零填充、不读"
+                 "图内激活；单像素块取有效 tap 的最小/最大值），再经 layer1 "
+                 "stride 2 映射到输入 [2·kmin−1, 2·kmax+2)，最后裁到图界；"
+                 "元素数 = 高 × 宽 × 输入通道数（本网络输入为 1 通道）。"
+                 "各候选边长的峰值取全网格所有分块的最大值。</p>")
     return "".join(parts)
 
 

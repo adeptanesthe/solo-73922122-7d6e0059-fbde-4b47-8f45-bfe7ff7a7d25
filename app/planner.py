@@ -1,13 +1,16 @@
 """分块尺寸选择：在激活预算内选 1..64 中最大的方形输出块边长。
 
-预算口径（按题目）：
-  对每个输出分块（边缘块按实际输出裁短），沿感受野链路反推出覆盖该块
+预算口径：
+  对每个输出分块（边缘块按实际输出裁短），沿两层感受野链路反推出覆盖该块
   所需的 *图内* 激活最小矩形窗口，元素数 = 窗口高 × 窗口宽 × 输入通道数，
-  取所有分块中的最大值作为该边长下的峰值用量。图外零填充不物化、不计入。
-  实跑时 TiledRunner 截取的正是同一个窗口，因此运行期峰值与此处预算一致。
+  取全网格所有分块中的最大值作为该边长下的峰值用量。图外零填充不物化、
+  不计入。实跑时 TiledRunner 截取的正是同一个窗口，因此运行期峰值与此处
+  预算一致。
 
-窗口链路：layer2 dilation2 使单输出在 layer1 输出上跨度 [i-2,i+2]，
-layer1 stride2 再映射到输入 [2r0-5, 2(r1-1)+6)，列同理，最后裁到图界。
+窗口链路：layer2 dilation2 使输出 i 读 layer1 输出 {i-2, i, i+2}（裁到有效
+输出界）；layer1 stride2 再映射到输入（见 conv.required_input_window）。
+行窗口只取决于行方向、列窗口只取决于列方向，故峰值可在两个轴上分别求
+最大值再相乘，无需枚举全网格的每个块对。
 """
 
 from __future__ import annotations
@@ -17,10 +20,10 @@ from dataclasses import dataclass
 from .conv import (
     L1_IN_CH,
     MAX_TILE_SIDE,
+    input_span,
     layer1_out_size,
-    required_input_window,
+    layer1_output_span,
 )
-
 
 @dataclass
 class TilePlan:
@@ -37,32 +40,21 @@ class TilePlan:
 def _peak_for_side(h: int, w: int, ho: int, wo: int, s: int) -> int:
     """边长 s 下，所有分块（含边缘裁短块）所需图内激活元素数的最大值。
 
-    窗口面积关于块高、块宽单调不减，而贴图界的裁剪只会缩小窗口。
-    全网格的峰值必落在以下三类候选块之一：
-      * 四角块（裁短且贴边，行/列方向都被裁剪）；
-      * 严格内部块（不贴任何图界，窗口不被裁剪，通常给出全局最大）；
-      * 边中块（仅行或仅列方向贴边）。
-    因此只需常数个候选块，无需枚举所有分块。
+    峰值 = (行方向最大窗口高) × (列方向最大窗口宽) × 输入通道数。
+    这里遍历该轴上的每个分块起点，取得精确最大值；边缘块按实际输出尺寸
+    裁短后单独计算，因此不会漏掉“短边块反而窗口更大”的情形。
     """
-    row_starts = list(range(0, ho, s))
-    col_starts = list(range(0, wo, s))
-
-    def block(r0, c0):
-        r1, c1 = min(r0 + s, ho), min(c0 + s, wo)
-        ir0, ir1, ic0, ic1 = required_input_window(r0, r1, c0, c1, h, w)
-        return (ir1 - ir0) * (ic1 - ic0) * L1_IN_CH
-
-    # 每个轴取“起点序列”的首、中、末三个代表（中部为不贴边的完整块）
-    def picks(starts):
-        mid = starts[len(starts) // 2]
-        out = [starts[0], mid, starts[-1]]
-        return sorted(set(out))
-
-    peak = 0
-    for r0 in picks(row_starts):
-        for c0 in picks(col_starts):
-            peak = max(peak, block(r0, c0))
-    return peak
+    max_h = 0
+    for r0 in range(0, ho, s):
+        kmin, kmax = layer1_output_span(r0, min(r0 + s, ho), ho)
+        ir0, ir1 = input_span(kmin, kmax, h)
+        max_h = max(max_h, ir1 - ir0)
+    max_w = 0
+    for c0 in range(0, wo, s):
+        jmin, jmax = layer1_output_span(c0, min(c0 + s, wo), wo)
+        ic0, ic1 = input_span(jmin, jmax, w)
+        max_w = max(max_w, ic1 - ic0)
+    return max_h * max_w * L1_IN_CH
 
 
 def plan_tiles(h: int, w: int, budget: int) -> TilePlan:

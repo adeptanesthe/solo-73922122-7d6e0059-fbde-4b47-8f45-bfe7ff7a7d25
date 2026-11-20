@@ -11,6 +11,7 @@ from PIL import Image
 
 from app.conv import (
     L1_OUT_CH,
+    MAX_TILE_SIDE,
     TiledRunner,
     layer1_out_size,
     required_input_window,
@@ -19,7 +20,7 @@ from app.conv import (
 )
 from app.io_utils import load_grayscale_png, load_weights_json
 from app.pipeline import ERROR_TOL, run_pipeline
-from app.planner import plan_tiles
+from app.planner import _peak_for_side, plan_tiles
 
 
 # --------------------------------------------------------------------- helpers
@@ -38,18 +39,67 @@ def png_bytes(arr: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def independent_window(r0, r1, c0, c1, h, w):
+    """从卷积语义直接求窗口，不复用被测实现。
+
+    输出 i 读 layer1 输出 {i-2, i, i+2}（裁到 [0,ho)）；
+    layer1 输出 k 读输入 {2k-1, 2k, 2k+1}（裁到 [0,h)）。
+    取实际被读到的输入坐标的最小/最大值的矩形外壳。
+    """
+    ho, wo = layer1_out_size(h, w)
+
+    def span(a0, a1, out_len, in_len):
+        l1 = set()
+        for i in range(a0, a1):
+            for t in (i - 2, i, i + 2):
+                if 0 <= t < out_len:
+                    l1.add(t)
+        ins = set()
+        for k in l1:
+            for t in (2 * k - 1, 2 * k, 2 * k + 1):
+                if 0 <= t < in_len:
+                    ins.add(t)
+        return min(ins), max(ins) + 1
+
+    ir0, ir1 = span(r0, r1, ho, h)
+    ic0, ic1 = span(c0, c1, wo, w)
+    return ir0, ir1, ic0, ic1
+
+
 # ----------------------------------------------------------- 1. 感受野窗口公式
 class TestWindow:
     def test_interior_single_pixel_11x11(self):
-        # 内部单输出像素：感受野在输入上是 11x11（两层 3x3、dilation2、stride2）
-        # 8x8 图，输出 4x4；内部输出 (1,1) 对应输入行 [-1,9]，裁到图内 [0,8)
-        r = required_input_window(1, 2, 1, 2, 8, 8)
-        assert r == (0, 8, 0, 8)
+        # 远离图界的单个输出像素：输入上完整感受野 11x11
+        # 输出 10 读 layer1 {8,10,12} -> 输入 [15,26)
+        r = required_input_window(10, 11, 10, 11, 64, 64)
+        assert r == (15, 26, 15, 26)
+        assert (r[1] - r[0]) * (r[3] - r[2]) == 121
+
+    def test_single_pixel_uses_valid_taps_only(self):
+        # 单像素块在 layer1 输出界附近：越界的 dilation tap 是 layer2 零填充，
+        # 不读任何图内激活，最小矩形不能把不存在的 tap 算进来。
+        # 8x8 -> 输出 4x4；输出 (1,1) 的 tap {1,3}，映射到输入 [1,8)
+        assert required_input_window(1, 2, 1, 2, 8, 8) == (1, 8, 1, 8)
+        # 3x3 -> 输出 2x2；角输出 (0,0) 仅 tap {0} -> 输入 [0,2)
+        assert required_input_window(0, 1, 0, 1, 3, 3) == (0, 2, 0, 2)
+        # 输出 (1,1) 的 tap {1}（0 与 3 越界）-> 输入 [1,3)
+        assert required_input_window(1, 2, 1, 2, 3, 3) == (1, 3, 1, 3)
 
     def test_corner_single_pixel_clipped(self):
-        # 左上角输出 (0,0)：输入行 [-5,6) -> 裁到 [0,6)
+        # 左上角输出 (0,0)：layer1 tap {0,2} -> 输入 [-1,6) -> 裁到 [0,6)
         r = required_input_window(0, 1, 0, 1, 8, 8)
         assert r == (0, 6, 0, 6)
+
+    def test_matches_independent_tap_union(self):
+        # 窗口必须恰好等于实际被读到的输入坐标的矩形外壳（对任意块）
+        for h, w in [(3, 3), (8, 8), (14, 14), (31, 17), (64, 64)]:
+            ho, wo = layer1_out_size(h, w)
+            for s in (1, 2, 3, 5):
+                for r0 in range(0, ho, s):
+                    for c0 in range(0, wo, s):
+                        args = (r0, min(r0 + s, ho), c0, min(c0 + s, wo), h, w)
+                        assert required_input_window(*args) == \
+                            independent_window(*args), (args, s)
 
     def test_tile_window_contains_each_member_pixel_window(self):
         # 块窗口必须覆盖块内每个像素各自的窗口
@@ -69,6 +119,7 @@ class TestWindow:
         top = required_input_window(r0, r0 + 1, c0, c0 + 1, h, w)
         bot = required_input_window(r1 - 1, r1, c0, c0 + 1, h, w)
         assert ir0 == top[0] and ir1 == bot[1]
+        assert (ir1 - ir0) == 17  # 4 输出行 -> 输入 [2*8-1, 2*15+2) = [15,32)
 
 
 # ----------------------------------------------------------- 2. 选型与预算
@@ -108,9 +159,35 @@ class TestPlanner:
         assert plan.peak_input_elems == 121
 
     def test_small_image_minimum_budget(self):
-        # 8x8 图 s=1：角块窗口 6x6=36，中心块窗口 8x8=64（边界已裁短）
+        # 8x8 -> 输出 4x4。s=1 单像素块：中心输出 (1,1)/(2,2) 的 tap 组合
+        # 有效范围给出 7x7=49；s=2 的 4 个块则为 8x8=64
         plan = plan_tiles(8, 8, budget=10)
-        assert not plan.feasible and plan.minimum_budget == 64
+        assert not plan.feasible and plan.minimum_budget == 49
+        assert dict(plan.per_side_peaks)[2] == 64
+
+    def test_14x14_budget_130_selects_side_1(self):
+        # 回归：s=2 时 (2,2) 处块需要 12x12=144 > 130，故只能选 s=1（121）。
+        # 旧实现只抽查角/中块，得出 121 并误选 s=2，实跑 144 超限。
+        plan = plan_tiles(14, 14, budget=130)
+        assert plan.feasible and plan.tile == 1
+        assert plan.peak_input_elems == 121
+        assert dict(plan.per_side_peaks)[2] == 144
+
+    def test_3x3_budget_4_is_feasible(self):
+        # 回归：3x3 -> 输出 2x2；每个单像素块只读 layer1 的一个有效 tap，
+        # 真实窗口 2x2=4。旧窗口公式按连续区间算成 3x3=9，误报不可行。
+        plan = plan_tiles(3, 3, budget=4)
+        assert plan.feasible and plan.tile == 1
+        assert plan.minimum_budget == 4 and plan.peak_input_elems == 4
+
+    def test_infeasible_reports_lowest_true_budget(self):
+        # 单像素块仍超限：只报真实最低预算，不执行推理（在流水线层验证）
+        rng = np.random.default_rng(31)
+        img = rng.random((14, 14))
+        res = run_pipeline(img, make_weights(rng), budget=120)
+        assert not res.feasible and res.metrics is None
+        assert res.plan["minimum_budget"] == 121
+        assert res.plan["tile"] is None
 
     def test_fast_peak_matches_full_enumeration(self):
         # 快速峰值算法（只查角块+内部块）必须与全网格枚举完全一致
@@ -144,6 +221,35 @@ class TestPlanner:
             r.run()
             assert r.peak_input_elems <= budget
             assert r.peak_input_elems == plan.peak_input_elems
+
+    def test_runtime_peak_equals_plan_for_every_side(self):
+        # 对多种尺寸/非方形/边缘情形，遍历每个候选边长核对实跑与规划峰值
+        rng = np.random.default_rng(41)
+        w1, b1, w2, b2 = validate_weights(make_weights(rng))
+        for h, w in [(3, 3), (3, 41), (8, 8), (14, 14), (14, 41), (31, 17),
+                     (64, 64), (100, 70)]:
+            img = rng.random((h, w))
+            ho, wo = layer1_out_size(h, w)
+            for s in range(1, min(ho, wo, 10) + 1):
+                expected = _peak_for_side(h, w, ho, wo, s)
+                r = TiledRunner(img, w1, b1, w2, b2, s)
+                r.run()
+                assert r.peak_input_elems == expected, (h, w, s)
+
+    def test_selected_side_is_largest_feasible(self):
+        # 选型必须满足：选中 s 的峰值 <= 预算，且更大的 s 全部超预算
+        for h, w in [(3, 3), (8, 8), (14, 14), (64, 64), (100, 70)]:
+            ho, wo = layer1_out_size(h, w)
+            for budget in (1, 4, 49, 121, 130, 144, 200, 1000):
+                plan = plan_tiles(h, w, budget)
+                if not plan.feasible:
+                    assert budget < plan.minimum_budget
+                    continue
+                assert plan.peak_input_elems == _peak_for_side(
+                    h, w, ho, wo, plan.tile)
+                assert plan.peak_input_elems <= budget
+                for s in range(plan.tile + 1, min(MAX_TILE_SIDE, ho, wo) + 1):
+                    assert _peak_for_side(h, w, ho, wo, s) > budget, (h, w, s)
 
 
 # ------------------------------------------------- 3. 分块 vs 整图基准（float64）
@@ -311,6 +417,38 @@ class TestHTTP:
         assert body["feasible"] is False
         assert body["plan"]["minimum_budget"] == 121
         assert body["metrics"] is None
+
+    @pytest.mark.parametrize("size,budget,tile", [(14, 130, 1), (3, 4, 1),
+                                                  (14, 120, None)])
+    def test_http_html_json_consistent(self, size, budget, tile):
+        # 网页与 JSON 必须对同一预算给出相同结论（含不可行时的最低预算）
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        client = TestClient(app)
+        rng = np.random.default_rng(size * 7 + budget)
+        img = (rng.random((size, size)) * 255).astype(np.uint8)
+        files = {"image": ("a.png", png_bytes(img), "image/png"),
+                 "weights": ("w.json", json.dumps(make_weights(rng)),
+                             "application/json")}
+        j = client.post("/infer", files=files,
+                        data={"budget": str(budget), "as_json": "1"}).json()
+        h = client.post("/infer", files=files, data={"budget": str(budget)})
+        assert h.status_code == 200
+        assert j["feasible"] == (tile is not None)
+        assert j["plan"]["tile"] == tile
+        if tile is None:
+            assert j["metrics"] is None
+            assert f"最低所需预算（s=1 峰值）" in h.text
+            assert str(j["plan"]["minimum_budget"]) in h.text
+            assert "未执行推理" in h.text
+        else:
+            assert j["metrics"]["passed"] in (True, False)
+            # 规划与实跑峰值一致，且网页同值
+            assert j["metrics"]["runtime_peak_input_elems"] == \
+                j["plan"]["peak_input_elems"]
+            assert f"<b>{tile}</b>" in h.text
+            assert str(j["metrics"]["runtime_peak_input_elems"]) in h.text
 
     def test_http_bad_request(self):
         from fastapi.testclient import TestClient

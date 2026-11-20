@@ -120,21 +120,57 @@ def run_full_baseline(image: np.ndarray, w1, b1, w2, b2) -> np.ndarray:
 # --------------------------------------------------------------------------
 # 分块推理
 # --------------------------------------------------------------------------
+def layer1_output_span(a0: int, a1: int,
+                       out_len: int) -> tuple[int, int]:
+    """输出轴区间 [a0, a1) 依赖的 layer1 输出坐标最小矩形（闭区间）。
+
+    layer2 输出 i 只读 layer1 输出 i-2、i、i+2（dilation=2 的三个 tap）。
+    这些 tap 必须裁到有效 layer1 输出界 [0, out_len)：越界位置是 layer2
+    的零填充，不读任何 layer1/输入激活。
+      * 多像素块（a1-a0 >= 2）：相邻输出的 tap 集合首尾相接，并集是连续
+        区间 [a0-2, a1+1]，再裁到输出界；
+      * 单像素块：tap 集合 {a0-2, a0, a0+2} 之间有空隙，矩形取有效 tap 的
+        最小/最大值（不能把中间不存在的 tap 也算进来）。
+    返回闭区间 (lo, hi)。
+    """
+    if a1 - a0 == 1:
+        taps = [k for k in (a0 - 2, a0, a0 + 2) if 0 <= k < out_len]
+        return min(taps), max(taps)
+    return max(a0 - 2, 0), min(a1 + 1, out_len - 1)
+
+
+def input_span(kmin: int, kmax: int, length: int) -> tuple[int, int]:
+    """layer1 输出闭区间 [kmin, kmax] 依赖的输入轴窗口（半开区间，已裁到图界）。
+
+    layer1 输出 k 读输入 2k-1、2k、2k+1，故矩形为
+    [2*kmin-1, 2*kmax+1]（闭），即半开 [2*kmin-1, 2*kmax+2)，再裁到 [0,length)。
+    """
+    return max(2 * kmin - 1, 0), min(2 * kmax + 2, length)
+
+
+def required_layer1_window(r0: int, r1: int, c0: int, c1: int,
+                           h: int, w: int) -> tuple[int, int, int, int]:
+    """输出块依赖的 layer1 输出矩形 (kmin, kmax, jmin, jmax)，闭区间。"""
+    ho, wo = layer1_out_size(h, w)
+    kmin, kmax = layer1_output_span(r0, r1, ho)
+    jmin, jmax = layer1_output_span(c0, c1, wo)
+    return kmin, kmax, jmin, jmax
+
+
 def required_input_window(r0: int, r1: int, c0: int, c1: int,
                           h: int, w: int) -> tuple[int, int, int, int]:
-    """输出块（layer2/layer1 输出坐标，半开区间）反推所需的最小图内激活窗口。
+    """输出块（layer2 输出坐标，半开区间）反推所需的最小图内激活窗口。
 
     感受野链路（layer1 stride=2，layer2 dilation=2）：
-      layer2 输出 (i,j) 读 layer1 输出坐标 i + 2*(kh-1)，即 [i-2, i+2]；
-      layer1 输出 k 读输入坐标 2k + (kh-1)，即 [2k-1, 2k+1]。
-      合并后单像素输入行窗口为 [2i-5, 2i+5]（11 行）；
-      输出块 r0..r1-1 的行窗口为 [2*r0-5, 2*(r1-1)+5]，列同理。
-    只保留落在图内 [0,H) x [0,W) 的部分（图外为零填充，无需物化）。
+      layer2 输出 i 读 layer1 输出 i + 2*(kh-1)，即 {i-2, i, i+2}；
+      layer1 输出 k 读输入 2k + (kh-1)，即 {2k-1, 2k, 2k+1}。
+    先求该块依赖的 layer1 输出最小矩形（裁到有效输出界，见
+    layer1_output_span），再映射为图内输入矩形并裁到图界。
+    图外零填充不物化、不计入。返回 (ir0, ir1, ic0, ic1)，半开区间。
     """
-    ir0 = max(2 * r0 - 5, 0)
-    ir1 = min(2 * (r1 - 1) + 6, h)
-    ic0 = max(2 * c0 - 5, 0)
-    ic1 = min(2 * (c1 - 1) + 6, w)
+    kmin, kmax, jmin, jmax = required_layer1_window(r0, r1, c0, c1, h, w)
+    ir0, ir1 = input_span(kmin, kmax, h)
+    ic0, ic1 = input_span(jmin, jmax, w)
     return ir0, ir1, ic0, ic1
 
 
@@ -185,12 +221,11 @@ class TiledRunner:
         ph, pw = patch.shape
         th, tw = r1 - r0, c1 - c0
 
-        # layer2 需要的 layer1 输出坐标范围（含 halo），裁到合法输出界
-        R0 = max(r0 - 2, 0)
-        R1 = min(r1 + 2, self.ho)
-        C0 = max(c0 - 2, 0)
-        C1 = min(c1 + 2, self.wo)
-        lh, lw = R1 - R0, C1 - C0
+        # layer2 需要的 layer1 输出矩形（含膨胀 halo，并裁到有效输出界）。
+        # 与 required_input_window 使用同一函数，保证预算与实跑同口径。
+        R0, R1, C0, C1 = required_layer1_window(
+            r0, r1, c0, c1, self.h, self.w)
+        lh, lw = R1 - R0 + 1, C1 - C0 + 1
 
         # ---- Layer 1（stride=2, pad=1），在 halo 区域上重算 ----
         ar_h = np.arange(lh)[:, None]
